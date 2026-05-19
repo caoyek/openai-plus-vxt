@@ -33,7 +33,7 @@ TG 群组：[https://t.me/fuck_open](https://t.me/fuck_open)
   - 右侧浮动面板，支持收起/展开。
   - 收起状态、当前 tab、输入内容和设置会保存在本地。
   - 设置页显示当前插件版本号，支持手动检测 GitHub Release 更新。
-  - 设置页提供 TG 群组入口：[https://t.me/fuck_open](https://t.me/fuck_open)。
+  - 设置页提供 TG 群组入口：[https://t.me/fuck_open](https://t.me/fuck_open)。 
 
 ## 截图
 
