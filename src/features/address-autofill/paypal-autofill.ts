@@ -13,7 +13,7 @@ const PAYPAL_GUEST_EMAIL_KEY = 'opx.paypal.guest.email';
 const PAYPAL_PASSWORD_KEY = 'opx.paypal.signup.password';
 const PAYPAL_FILLED_ATTR = 'data-opx-paypal-filled';
 const PAYPAL_RANDOM_BUTTON_ID = 'opx-paypal-random-fill';
-const MAX_AUTOFILL_ATTEMPTS_PER_PAGE = 3;
+const MAX_AUTOFILL_ATTEMPTS_PER_PAGE = 40;
 const PAYPAL_COUNTRY_LABELS: Record<string, string> = {
   AR: 'Argentina',
   AU: 'Australia',
@@ -57,6 +57,8 @@ let consentTimer: number | null = null;
 let reviewSubmitClicked = false;
 let reviewSubmitTimer: number | null = null;
 let reviewSubmitAllowedAt = 0;
+let delayedFreshFillScheduled = false;
+let delayedFreshFillRunning = false;
 
 export function initPaypalAutofill(): void {
   if (initialized || !isPaypalAutomationPage()) {
@@ -84,6 +86,7 @@ export function initPaypalAutofill(): void {
   installRandomFillButton();
   installStorageListener();
   installObserver();
+  scheduleDelayedFreshAddressAutofill();
   if (consumePendingManualFill()) {
     scheduleManualSessionAutofill(900);
   } else {
@@ -182,7 +185,8 @@ export async function fillPaypalAddressNow(
     resetAttempts();
   }
   const result = await fillPaypalSignupFields(targetAddress, allowRetry);
-  if (!result.countryChanged) {
+  const ready = arePaypalSignupRequiredFieldsReady();
+  if (!result.countryChanged && (result.filled > 0 || ready)) {
     reviewSubmitAllowedAt = Date.now() + 900;
     scheduleReviewSubmitClick(1800);
   }
@@ -197,7 +201,7 @@ export async function fillPaypalAddressNow(
     }
   }
   return {
-    ok: result.filled > 0 || result.countryChanged,
+    ok: result.filled > 0 || result.countryChanged || ready,
     filled: result.filled,
     countryChanged: result.countryChanged,
     message: result.countryChanged
@@ -226,9 +230,13 @@ async function runAutofill(): Promise<void> {
 
     const result = await fillPaypalAddressNow();
     console.info(`${LOG_PREFIX} ${result.message}`);
-    if (!result.ok || reachedAttemptLimit()) {
+    if (reachedAttemptLimit() && isPaypalSignupFormReady()) {
       observer?.disconnect();
       observer = null;
+      return;
+    }
+    if (!result.ok) {
+      scheduleAutofill(1200);
     }
   } catch (error) {
     console.warn(`${LOG_PREFIX} failed`, error);
@@ -267,6 +275,13 @@ async function getPageAddress(settings: AddressAutofillSettings): Promise<Addres
 
 async function fillPaypalSignupFields(address: AddressProfile, allowRetry: boolean): Promise<{ filled: number; countryChanged: boolean }> {
   let filled = 0;
+  if (!isPaypalSignupFormReady()) {
+    if (allowRetry) {
+      scheduleAutofill(1200);
+    }
+    return { filled: 0, countryChanged: false };
+  }
+
   const countryChanged = selectCountry(address);
   if (countryChanged) {
     if (allowRetry) {
@@ -893,22 +908,13 @@ async function fetchFreshAddressAndFill(button: HTMLButtonElement, status: HTMLE
   status.textContent = '正在获取新资料';
 
   try {
-    const settings = await loadAddressAutofillSettings();
-    const response = await browser.runtime.sendMessage({
-      type: 'opx:fetch-random-address',
-      countryCode: settings.countryCode,
-      city: settings.city,
-    });
-
-    if (!isRandomAddressResponse(response) || !response.ok || !response.address) {
-      status.textContent = response?.message || '获取失败';
+    const address = await fetchFreshPaypalAddress();
+    if (!address) {
+      status.textContent = '获取失败';
       return;
     }
 
-    pageAddress = response.address;
-    rememberSessionAddress(response.address);
-    await saveAddressAutofillSettings({ lastAddress: response.address });
-    const result = await fillPaypalAddressNow(response.address, true, false);
+    const result = await fillPaypalAddressNow(address, true, false);
     status.textContent = result.countryChanged
       ? '已切换国家，刷新后继续填写'
       : result.ok
@@ -924,6 +930,25 @@ async function fetchFreshAddressAndFill(button: HTMLButtonElement, status: HTMLE
       opacity: '1',
     });
   }
+}
+
+async function fetchFreshPaypalAddress(): Promise<AddressProfile | null> {
+  const settings = await loadAddressAutofillSettings();
+  const response = await browser.runtime.sendMessage({
+    type: 'opx:fetch-random-address',
+    countryCode: settings.countryCode,
+    city: settings.city,
+  });
+
+  if (!isRandomAddressResponse(response) || !response.ok || !response.address) {
+    console.warn(`${LOG_PREFIX} fresh address fetch failed`, response);
+    return null;
+  }
+
+  pageAddress = response.address;
+  rememberSessionAddress(response.address);
+  await saveAddressAutofillSettings({ lastAddress: response.address });
+  return response.address;
 }
 
 function findCardBrandAnchor(): Element | null {
@@ -1216,6 +1241,46 @@ function scheduleManualSessionAutofill(delayMs: number): void {
   }, delayMs);
 }
 
+function scheduleDelayedFreshAddressAutofill(): void {
+  if (delayedFreshFillScheduled) {
+    return;
+  }
+  delayedFreshFillScheduled = true;
+  window.setTimeout(() => {
+    void runDelayedFreshAddressAutofill(true);
+  }, 5000);
+}
+
+async function runDelayedFreshAddressAutofill(allowSecondAttempt: boolean): Promise<void> {
+  if (delayedFreshFillRunning || !isPaypalSignupPage()) {
+    return;
+  }
+
+  delayedFreshFillRunning = true;
+  try {
+    const address = await fetchFreshPaypalAddress();
+    if (!address) {
+      if (allowSecondAttempt) {
+        window.setTimeout(() => void runDelayedFreshAddressAutofill(false), 2500);
+      }
+      return;
+    }
+
+    await fillPaypalAddressNow(address, true, true);
+    window.setTimeout(() => {
+      if (allowSecondAttempt && !arePaypalSignupRequiredFieldsReady()) {
+        resetFilledMarks();
+        resetAttempts();
+        void runDelayedFreshAddressAutofill(false);
+      }
+    }, 3500);
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} delayed fresh fill failed`, error);
+  } finally {
+    delayedFreshFillRunning = false;
+  }
+}
+
 function loadSessionAddress(): AddressProfile | null {
   try {
     const raw = sessionStorage.getItem(PAYPAL_ADDRESS_SESSION_KEY);
@@ -1345,12 +1410,16 @@ function getOrCreateGuestEmail(): string {
 
 function getOrCreatePaypalPassword(): string {
   const saved = sessionStorage.getItem(PAYPAL_PASSWORD_KEY);
-  if (saved && /^[a-zA-Z0-9]{10}$/.test(saved)) {
+  if (saved && isValidPaypalPassword(saved)) {
     return saved;
   }
-  const password = randomAlphaNumeric(10);
+  const password = randomPaypalPassword(10);
   sessionStorage.setItem(PAYPAL_PASSWORD_KEY, password);
   return password;
+}
+
+function isValidPaypalPassword(value: string): boolean {
+  return value.length >= 8 && value.length <= 20 && /[0-9!@#$%^]/.test(value);
 }
 
 function findPaypalCreateAccountButton(): HTMLButtonElement | null {
@@ -1500,6 +1569,27 @@ function isPaypalReviewSubmitAllowed(): boolean {
   return arePaypalSignupRequiredFieldsReady();
 }
 
+function isPaypalSignupFormReady(): boolean {
+  if (!isPaypalSignupPage()) {
+    return false;
+  }
+
+  const selectors = [
+    PAYPAL_FIELDS.email,
+    PAYPAL_FIELDS.password,
+    PAYPAL_FIELDS.phone,
+    PAYPAL_FIELDS.cardNumber,
+    PAYPAL_FIELDS.firstName,
+    PAYPAL_FIELDS.address1,
+    PAYPAL_FIELDS.postalCode,
+  ];
+
+  return selectors.some((items) => {
+    const input = findTextControl(items);
+    return Boolean(input && isVisible(input));
+  }) || Boolean(findSelect(PAYPAL_FIELDS.country));
+}
+
 function arePaypalSignupRequiredFieldsReady(): boolean {
   const textFields = [
     PAYPAL_FIELDS.email,
@@ -1594,6 +1684,23 @@ function randomDigits(length: number): string {
 function randomAlphaNumeric(length: number): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   return Array.from({ length }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+}
+
+function randomPaypalPassword(length: number): string {
+  const safeLength = Math.min(20, Math.max(8, length));
+  const symbols = '!@#$%^';
+  const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const password = randomAlphaNumeric(safeLength - 1) + symbols[Math.floor(Math.random() * symbols.length)];
+  return shuffleString(password || `${alphabet[Math.floor(Math.random() * alphabet.length)]}1`);
+}
+
+function shuffleString(value: string): string {
+  const chars = value.split('');
+  for (let index = chars.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [chars[index], chars[swapIndex]] = [chars[swapIndex], chars[index]];
+  }
+  return chars.join('');
 }
 
 function delay(ms: number): Promise<void> {
