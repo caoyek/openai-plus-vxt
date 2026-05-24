@@ -4,8 +4,10 @@ import type { AddressProfile, RandomAddressResponse } from './types';
 
 const LOG_PREFIX = '[OPX Pay Autofill]';
 const PAYPAL_SELECTORS = [
-  '[data-testid="paypal-accordion-item"]',
+  'label[for="payment-method-accordion-item-title-paypal"]',
   '#payment-method-accordion-item-title-paypal',
+  '#payment-method-label-paypal',
+  '[data-testid="paypal-accordion-item"]',
   'button[data-testid="paypal-accordion-item-button"]',
   'button[aria-label*="PayPal"]',
   'button[aria-label*="paypal" i]',
@@ -16,6 +18,11 @@ let running = false;
 let scheduledTimer: number | null = null;
 let pageAddress: AddressProfile | null = null;
 let pageAddressScope = '';
+let subscribeClicked = false;
+let subscribePending = false;
+let subscribeAttempts = 0;
+let subscribeTimer: number | null = null;
+let autocompleteSettleAttempts = 0;
 
 export function initPayOpenAiAddressAutofill(): void {
   if (initialized || location.hostname !== 'pay.openai.com') {
@@ -67,14 +74,263 @@ export async function fillPayOpenAiAddressNow(address: AddressProfile): Promise<
     return { ok: false, filled: 0, message: '当前不是 pay.openai.com 页面' };
   }
 
-  selectPaypalIfPresent();
-  await delay(450);
+  const selectedPaypal = selectPaypalIfPresent();
+  if (selectedPaypal) {
+    schedulePaypalSelectRetry();
+  }
+  await delay(selectedPaypal ? 1400 : 650);
   const filled = await fillCheckoutFields(address);
+  subscribeAttempts = 0;
+  autocompleteSettleAttempts = 0;
+  scheduleSubscribeClick(1800);
+  startSubscribeWatcher();
   return {
     ok: filled > 0,
     filled,
     message: filled > 0 ? `已填写 OpenAI 支付页 ${filled} 项` : '未找到可填写的 OpenAI 支付字段',
   };
+}
+
+function scheduleSubscribeClick(delayMs: number): void {
+  if ((subscribeClicked && !findSubscribeButton()) || subscribePending) {
+    return;
+  }
+  window.setTimeout(() => {
+    if ((subscribeClicked && !findSubscribeButton()) || subscribePending) {
+      return;
+    }
+    if (isAddressAutocompleteOpen()) {
+      settleAddressAutocomplete();
+    }
+    if (!isReadyToSubscribe()) {
+      subscribeAttempts += 1;
+      if (subscribeAttempts < 80) {
+        scheduleSubscribeClick(1200);
+      }
+      return;
+    }
+
+    const button = findSubscribeButton();
+    if (!button || button.disabled || !isVisible(button)) {
+      subscribeAttempts += 1;
+      if (subscribeAttempts < 80) {
+        scheduleSubscribeClick(1200);
+      }
+      return;
+    }
+    subscribePending = true;
+    window.setTimeout(() => {
+      subscribePending = false;
+      if (subscribeClicked || !isReadyToSubscribe()) {
+        return;
+      }
+      const readyButton = findSubscribeButton();
+      if (!readyButton || readyButton.disabled || !isVisible(readyButton)) {
+        scheduleSubscribeClick(900);
+        return;
+      }
+      subscribeClicked = true;
+      clickElement(readyButton);
+      window.setTimeout(() => {
+        if (findSubscribeButton()) {
+          subscribeClicked = false;
+          scheduleSubscribeClick(900);
+        } else {
+          stopSubscribeWatcher();
+        }
+      }, 2500);
+    }, 900);
+  }, delayMs);
+}
+
+function startSubscribeWatcher(): void {
+  if (subscribeTimer) {
+    return;
+  }
+  subscribeTimer = window.setInterval(() => {
+    if (subscribeClicked && !findSubscribeButton()) {
+      stopSubscribeWatcher();
+      return;
+    }
+    scheduleSubscribeClick(0);
+  }, 1800);
+}
+
+function stopSubscribeWatcher(): void {
+  if (subscribeTimer) {
+    window.clearInterval(subscribeTimer);
+    subscribeTimer = null;
+  }
+}
+
+function isReadyToSubscribe(): boolean {
+  return isPaypalSelected() && isBillingAddressReady();
+}
+
+function isPaypalSelected(): boolean {
+  const paypalRadio = document.querySelector<HTMLInputElement>('#payment-method-accordion-item-title-paypal');
+  const paypalItem = document.querySelector<HTMLElement>('[data-testid="paypal-accordion-item"]');
+  if (!paypalRadio && !paypalItem) {
+    return true;
+  }
+  return Boolean(
+    paypalRadio?.checked ||
+      paypalRadio?.getAttribute('aria-checked') === 'true' ||
+      paypalItem?.className.includes('selected') ||
+      paypalItem?.querySelector<HTMLInputElement>('input[value="paypal"]')?.getAttribute('aria-checked') === 'true'
+  );
+}
+
+function isBillingAddressReady(): boolean {
+  const country = getFieldValue('#billingCountry') || getAutocompleteFieldValue('billing country');
+  const line1 = getFieldValue('#billingAddressLine1') || getAutocompleteFieldValue('billing address-line1');
+  const city = getFieldValue('#billingLocality') || getAutocompleteFieldValue('billing address-level2');
+  const postalCode = getFieldValue('#billingPostalCode') || getAutocompleteFieldValue('billing postal-code');
+  const state = getFieldValue('#billingAdministrativeArea') || getAutocompleteFieldValue('billing address-level1');
+
+  if (!country || !line1 || !city || !postalCode) {
+    return false;
+  }
+
+  const countryCode = country.toUpperCase();
+  if ((countryCode === 'US' || countryCode.includes('美国') || countryCode.includes('UNITED STATES')) && hasField('#billingAdministrativeArea')) {
+    return Boolean(state);
+  }
+
+  return true;
+}
+
+function isAddressAutocompleteOpen(): boolean {
+  return Array.from(document.querySelectorAll<HTMLElement>('.AddressAutocomplete-results--showing, .AddressAutocomplete-results'))
+    .some((element) => isVisible(element));
+}
+
+function settleAddressAutocomplete(): void {
+  autocompleteSettleAttempts += 1;
+  const selected = document.querySelector<HTMLElement>(
+    '.AddressAutocomplete-result--selected, .AddressAutocomplete-results--showing [role="option"], .AddressAutocomplete-result',
+  );
+  if (selected && isVisible(selected)) {
+    clickElement(selected);
+    return;
+  }
+
+  const input = document.querySelector<HTMLInputElement>('#billingAddressLine1') ||
+    document.querySelector<HTMLInputElement>('input[autocomplete="billing address-line1"]');
+  if (!input) {
+    return;
+  }
+
+  input.focus();
+  const key = autocompleteSettleAttempts <= 2 ? 'Enter' : 'Escape';
+  input.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, bubbles: true, cancelable: true }));
+  input.dispatchEvent(new KeyboardEvent('keyup', { key, code: key, bubbles: true, cancelable: true }));
+  if (autocompleteSettleAttempts > 2) {
+    input.blur();
+  }
+}
+
+function hasField(selector: string): boolean {
+  return Boolean(document.querySelector(selector));
+}
+
+function getAutocompleteFieldValue(autocomplete: string): string {
+  const escaped = cssEscape(autocomplete);
+  return getFieldValue(`input[autocomplete="${escaped}"], textarea[autocomplete="${escaped}"], select[autocomplete="${escaped}"]`);
+}
+
+function getFieldValue(selector: string): string {
+  const element = document.querySelector(selector);
+  if (isSelectControl(element)) {
+    const selected = element.selectedOptions[0];
+    return (element.value || selected?.text || '').trim();
+  }
+  if (isTextControl(element)) {
+    return element.value.trim();
+  }
+  return '';
+}
+
+function findSubscribeButton(): HTMLButtonElement | null {
+  const textContainerButton = document.querySelector<HTMLElement>('.SubmitButton-TextContainer')?.closest('button');
+  if (textContainerButton instanceof HTMLButtonElement && isVisible(textContainerButton) && !textContainerButton.disabled && isSubscribeButtonText(textContainerButton)) {
+    return textContainerButton;
+  }
+
+  const iconButton = document.querySelector<HTMLElement>('.SubmitButton-IconContainer')?.closest('button');
+  if (iconButton instanceof HTMLButtonElement && isVisible(iconButton) && !isNonSubmitButton(iconButton)) {
+    return iconButton;
+  }
+
+  const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button[type="submit"], button'))
+    .filter(isVisible)
+    .filter((button) => !button.disabled && !isNonSubmitButton(button))
+    .map((button) => ({
+      button,
+      score: scoreSubscribeButton(button),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+  return buttons[0]?.button || null;
+}
+
+function isSubscribeButtonText(button: HTMLButtonElement): boolean {
+  const currentText = normalizedText(
+    button.querySelector<HTMLElement>('.SubmitButton-Text--current[aria-hidden="false"]')?.textContent ||
+      button.textContent ||
+      button.getAttribute('aria-label') ||
+      '',
+  );
+  const processingText = normalizedText(button.querySelector<HTMLElement>('[data-testid="submit-button-processing-label"]')?.textContent || '');
+  if (processingText && currentText.includes(processingText) && !currentText.includes('订阅') && !currentText.includes('subscribe')) {
+    return false;
+  }
+  return currentText.includes('订阅') ||
+    currentText.includes('subscribe') ||
+    currentText.includes('pay') ||
+    currentText.includes('支付') ||
+    currentText.includes('continue') ||
+    currentText.includes('继续');
+}
+
+function scoreSubscribeButton(button: HTMLButtonElement): number {
+  const text = normalizedText(button.textContent || button.getAttribute('aria-label') || '');
+  const className = String(button.className || '');
+  let score = 0;
+  if (button.type === 'submit') {
+    score += 20;
+  }
+  if (className.includes('SubmitButton')) {
+    score += 40;
+  }
+  if (button.querySelector('.SubmitButton-IconContainer')) {
+    score += 30;
+  }
+  if (
+    text.includes('订阅') ||
+    text.includes('subscribe') ||
+    text.includes('pay') ||
+    text.includes('支付') ||
+    text.includes('continue') ||
+    text.includes('继续')
+  ) {
+    score += 20;
+  }
+  return score;
+}
+
+function isNonSubmitButton(button: HTMLButtonElement): boolean {
+  const text = normalizedText(button.textContent || button.getAttribute('aria-label') || '');
+  const className = String(button.className || '');
+  return Boolean(
+    button.closest('[data-testid="paypal-accordion-item"]') ||
+      button.closest('.AddressAutocomplete--clear-button-container') ||
+      className.includes('AddressAutocomplete--clear-button') ||
+      text.includes('清空') ||
+      text.includes('手动输入地址') ||
+      text.includes('manual') ||
+      text.includes('paypal')
+  );
 }
 
 async function getPageAddress(settings: AddressAutofillSettings): Promise<AddressProfile | null> {
@@ -134,13 +390,27 @@ async function fillCheckoutFields(address: AddressProfile): Promise<number> {
 
 function selectPaypalIfPresent(): boolean {
   const paypalRadio = document.querySelector<HTMLInputElement>('#payment-method-accordion-item-title-paypal');
-  if (paypalRadio?.checked) {
+  const paypalItem = document.querySelector<HTMLElement>('[data-testid="paypal-accordion-item"]');
+  if (paypalRadio?.checked || paypalRadio?.getAttribute('aria-checked') === 'true' || paypalItem?.className.includes('selected')) {
+    return true;
+  }
+
+  const candidates = paypalClickCandidates();
+  for (const candidate of candidates) {
+    clickElement(candidate);
+  }
+  if (candidates.length) {
+    return true;
+  }
+
+  if (paypalRadio) {
+    forceRadioSelection(paypalRadio);
     return true;
   }
 
   for (const selector of PAYPAL_SELECTORS) {
     const element = document.querySelector<HTMLElement>(selector);
-    if (!element || !isVisible(element)) {
+    if (!element) {
       continue;
     }
     clickElement(element);
@@ -157,6 +427,54 @@ function selectPaypalIfPresent(): boolean {
   }
 
   return false;
+}
+
+function paypalClickCandidates(): HTMLElement[] {
+  const selectors = [
+    'button[data-testid="paypal-accordion-item-button"]',
+    '[data-testid="paypal-accordion-item"] .AccordionItemHeader',
+    '[data-testid="paypal-accordion-item"] .AccordionItemCover-titleContainer',
+    '[data-testid="paypal-accordion-item"] .PaymentMethodFormAccordionItemTitle',
+    '[data-testid="paypal-accordion-item"] #payment-method-label-paypal',
+    '[data-testid="paypal-accordion-item"] .AccordionItemCover',
+    '[data-testid="paypal-accordion-item"]',
+    '#payment-method-accordion-item-title-paypal',
+  ];
+  const seen = new Set<HTMLElement>();
+  const candidates: HTMLElement[] = [];
+  for (const selector of selectors) {
+    const element = document.querySelector<HTMLElement>(selector);
+    if (!element || seen.has(element)) {
+      continue;
+    }
+    seen.add(element);
+    candidates.push(element);
+  }
+  return candidates;
+}
+
+function forceRadioSelection(radio: HTMLInputElement): void {
+  radio.checked = true;
+  radio.setAttribute('aria-checked', 'true');
+  radio.dispatchEvent(new Event('input', { bubbles: true }));
+  radio.dispatchEvent(new Event('change', { bubbles: true }));
+  clickElement(radio);
+}
+
+function schedulePaypalSelectRetry(): void {
+  for (const delayMs of [450, 1100, 2100]) {
+    window.setTimeout(() => {
+      const paypalRadio = document.querySelector<HTMLInputElement>('#payment-method-accordion-item-title-paypal');
+      const paypalItem = document.querySelector<HTMLElement>('[data-testid="paypal-accordion-item"]');
+      if (paypalRadio?.checked || paypalRadio?.getAttribute('aria-checked') === 'true' || paypalItem?.className.includes('selected')) {
+        return;
+      }
+      const candidates = paypalClickCandidates();
+      for (const candidate of candidates) {
+        clickElement(candidate);
+      }
+    }, delayMs);
+  }
 }
 
 function fillInput(selector: string, value: string, overwrite: boolean): number {
@@ -286,6 +604,9 @@ function emitChange(element: HTMLElement): void {
 
 function clickElement(element: HTMLElement): void {
   element.scrollIntoView({ block: 'center', inline: 'center' });
+  element.focus?.();
+  element.click();
+  clickElementCenter(element);
   for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
     const EventCtor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
     element.dispatchEvent(new EventCtor(type, {
@@ -299,6 +620,22 @@ function clickElement(element: HTMLElement): void {
     }));
   }
   element.click();
+}
+
+function clickElementCenter(element: HTMLElement): void {
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return;
+  }
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const target = document.elementFromPoint(x, y);
+  if (!(target instanceof HTMLElement) || target === element) {
+    return;
+  }
+  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
+  target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
+  target.click();
 }
 
 function installObserver(): void {

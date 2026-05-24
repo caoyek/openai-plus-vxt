@@ -1,5 +1,5 @@
 import { checkLatestVersion } from '../version-check/github';
-import { loadAddressAutofillSettings, saveAddressAutofillSettings } from './state';
+import { loadAddressAutofillSettings, loadTempMailSettings, saveAddressAutofillSettings, saveTempMailSettings } from './state';
 
 const TG_GROUP_URL = 'https://t.me/fuck_open';
 
@@ -56,6 +56,26 @@ export function createSettingsDialog(options: SettingsDialogOptions = {}): Setti
     '用于 paypal.com/checkoutweb/signup 页面，填写国家、邮箱、卡资料、姓名、地址和密码提示。',
   );
 
+  const tempMailTitle = document.createElement('div');
+  tempMailTitle.className = 'opx-setting-section-title';
+  tempMailTitle.textContent = '临时邮箱';
+  const tempMailApiBaseInput = createTextInput('https://mail.example.com');
+  const tempMailAdminAuthInput = createTextInput('admin_auth');
+  tempMailAdminAuthInput.type = 'password';
+  const tempMailDomainInput = createTextInput('example.com');
+  const tempMailNameInput = createTextInput('留空则随机生成');
+  const tempMailCustomAuthInput = createTextInput('可选');
+  tempMailCustomAuthInput.type = 'password';
+  const tempMailGrid = document.createElement('div');
+  tempMailGrid.className = 'opx-grid';
+  tempMailGrid.append(
+    createInputField('Worker 地址', tempMailApiBaseInput),
+    createInputField('admin_auth', tempMailAdminAuthInput),
+    createInputField('邮箱域名', tempMailDomainInput),
+    createInputField('邮箱名称', tempMailNameInput),
+    createInputField('x-custom-auth', tempMailCustomAuthInput),
+  );
+
   const checkUpdateButton = document.createElement('button');
   checkUpdateButton.className = 'opx-external-link-button';
   checkUpdateButton.type = 'button';
@@ -75,7 +95,7 @@ export function createSettingsDialog(options: SettingsDialogOptions = {}): Setti
   const status = document.createElement('div');
   status.className = 'opx-status';
 
-  dialog.append(header, payOpenAiItem, payPalSignupItem, checkUpdateButton, tgGroupButton, hint, status);
+  dialog.append(header, payOpenAiItem, payPalSignupItem, tempMailTitle, tempMailGrid, checkUpdateButton, tgGroupButton, hint, status);
   overlay.append(dialog);
 
   closeButton.addEventListener('click', close);
@@ -93,6 +113,10 @@ export function createSettingsDialog(options: SettingsDialogOptions = {}): Setti
     await saveAddressAutofillSettings({ payPalSignupEnabled: payPalSignupCheckbox.checked });
     setStatus(status, '设置已保存', 'ok');
   });
+  for (const input of [tempMailApiBaseInput, tempMailAdminAuthInput, tempMailDomainInput, tempMailNameInput, tempMailCustomAuthInput]) {
+    input.addEventListener('change', () => void saveTempMailInputs());
+    input.addEventListener('blur', () => void saveTempMailInputs());
+  }
   tgGroupButton.addEventListener('click', () => {
     window.open(TG_GROUP_URL, '_blank', 'noopener,noreferrer');
   });
@@ -118,10 +142,21 @@ export function createSettingsDialog(options: SettingsDialogOptions = {}): Setti
 
   const update = async () => {
     const settings = await loadAddressAutofillSettings();
+    const tempMail = await loadTempMailSettings();
     payOpenAiCheckbox.checked = settings.payOpenAiEnabled;
     payPalSignupCheckbox.checked = settings.payPalSignupEnabled;
+    tempMailApiBaseInput.value = tempMail.apiBase;
+    tempMailAdminAuthInput.value = tempMail.adminAuth;
+    tempMailDomainInput.value = tempMail.domain;
+    tempMailNameInput.value = tempMail.mailboxName;
+    tempMailCustomAuthInput.value = tempMail.customAuth;
     const enabledCount = Number(settings.payOpenAiEnabled) + Number(settings.payPalSignupEnabled);
-    setStatus(status, enabledCount > 0 ? `已开启 ${enabledCount} 项自动填写` : '自动填写未开启', enabledCount > 0 ? 'ok' : 'pending');
+    const tempMailReady = Boolean(tempMail.apiBase && tempMail.adminAuth && tempMail.domain);
+    setStatus(
+      status,
+      tempMailReady ? `临时邮箱已配置 · 已开启 ${enabledCount} 项自动填写` : '请先配置临时邮箱 Worker、admin_auth 和域名',
+      tempMailReady ? 'ok' : 'pending',
+    );
   };
 
   return {
@@ -135,6 +170,17 @@ export function createSettingsDialog(options: SettingsDialogOptions = {}): Setti
 
   function close(): void {
     overlay.hidden = true;
+  }
+
+  async function saveTempMailInputs(): Promise<void> {
+    await saveTempMailSettings({
+      apiBase: tempMailApiBaseInput.value,
+      adminAuth: tempMailAdminAuthInput.value,
+      domain: tempMailDomainInput.value,
+      mailboxName: tempMailNameInput.value,
+      customAuth: tempMailCustomAuthInput.value,
+    });
+    setStatus(status, '临时邮箱设置已保存', 'ok');
   }
 }
 
@@ -154,6 +200,25 @@ function createSettingItem(checkbox: HTMLInputElement, title: string, descriptio
 
   item.append(label, descriptionElement);
   return item;
+}
+
+function createTextInput(placeholder: string): HTMLInputElement {
+  const input = document.createElement('input');
+  input.className = 'opx-input';
+  input.type = 'text';
+  input.placeholder = placeholder;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  return input;
+}
+
+function createInputField(labelText: string, input: HTMLInputElement): HTMLElement {
+  const label = document.createElement('label');
+  label.className = 'opx-field';
+  const span = document.createElement('span');
+  span.textContent = labelText;
+  label.append(span, input);
+  return label;
 }
 
 function createTelegramIcon(): SVGSVGElement {

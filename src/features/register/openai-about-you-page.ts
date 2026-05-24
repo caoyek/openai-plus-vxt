@@ -36,7 +36,10 @@ const FIRST_NAMES = [
 ];
 
 export function isAboutYouPage(): boolean {
-  return location.hostname === 'auth.openai.com' && location.pathname.startsWith('/about-you');
+  if (!isOpenAiAuthHost()) {
+    return false;
+  }
+  return Boolean(findNameInput() && findAgeInput(findNameInput()));
 }
 
 export async function fillAboutYouAndCreate(): Promise<ActionResult> {
@@ -88,7 +91,7 @@ function findNameInput(): HTMLInputElement | null {
 
   for (const selector of NAME_SELECTORS) {
     const input = document.querySelector<HTMLInputElement>(selector);
-    if (input && !looksLikeAgeInput(input)) {
+    if (input && isVisible(input) && !looksLikeAgeInput(input)) {
       return input;
     }
   }
@@ -104,7 +107,7 @@ function findAgeInput(nameInput: HTMLInputElement | null): HTMLInputElement | nu
 
   for (const selector of AGE_SELECTORS) {
     const inputs = Array.from(document.querySelectorAll<HTMLInputElement>(selector));
-    const input = inputs.find((item) => item !== nameInput && looksLikeAgeInput(item));
+    const input = inputs.find((item) => item !== nameInput && isVisible(item) && looksLikeAgeInput(item));
     if (input) {
       return input;
     }
@@ -143,7 +146,7 @@ function labelText(ids: string): string {
 function textInputs(): HTMLInputElement[] {
   return Array.from(document.querySelectorAll<HTMLInputElement>('input')).filter((input) => {
     const type = (input.type || 'text').toLowerCase();
-    return ['text', 'number', 'tel', ''].includes(type);
+    return ['text', 'number', 'tel', ''].includes(type) && isVisible(input);
   });
 }
 
@@ -215,4 +218,16 @@ function ok(message: string): ActionResult {
 
 function fail(message: string): ActionResult {
   return { ok: false, message };
+}
+
+function isOpenAiAuthHost(): boolean {
+  return location.hostname === 'chatgpt.com' ||
+    location.hostname === 'auth.openai.com' ||
+    location.hostname === 'chat.openai.com';
+}
+
+function isVisible(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
 }

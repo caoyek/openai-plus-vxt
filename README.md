@@ -7,9 +7,9 @@ TG 群组：[https://t.me/fuck_open](https://t.me/fuck_open)
 ## 功能
 
 - 注册辅助
-  - 支持单邮箱输入。
-  - 支持 `email----password----client_id----refresh_token` 格式的 Outlook 账号行。
-  - 在 OpenAI 邮箱验证码页可手动填验证码，也可通过本地 Outlook API 自动收码并提交。
+  - 支持在设置中配置 Temp Mail Worker、`admin_auth` 和邮箱域名。
+  - 点击“生成邮箱并继续”会自动创建临时邮箱地址并提交注册邮箱。
+  - 在 OpenAI 邮箱验证码页可手动填验证码，也可通过临时邮箱 API 自动收码并提交。
   - 在资料页自动填写英文姓名和年龄。
 
 - 提链接
@@ -109,21 +109,21 @@ pnpm build:firefox
 pnpm zip:firefox
 ```
 
-## Outlook 自动收码 API
+## 临时邮箱自动收码 API
 
-注册模块支持通过本地服务读取 Outlook 验证码。默认 API 地址：
+注册模块支持使用 [Temp Mail](https://temp-mail-docs.awsl.uk/zh/guide/feature/new-address-api.html) 的地址 JWT 邮件 API 自动读取验证码。
 
-```text
-http://127.0.0.1:8787
-```
-
-账号行格式：
+在设置页填写：
 
 ```text
-email----password----client_id----refresh_token
+Worker 地址
+admin_auth
+邮箱域名
 ```
 
-插件会调用本地服务的 Outlook 邮件接口等待验证码。没有本地服务时，可以使用单邮箱模式，验证码手动输入。
+如果启用了私有站点密码，也可以填写 `x-custom-auth`。邮箱名称可留空，留空时插件会随机生成。
+
+插件会在点击“生成邮箱并继续”时调用 `POST /admin/new_address` 创建邮箱地址，然后调用 `GET /api/mails` 轮询邮件，并从返回的 raw/source 邮件内容中提取 OpenAI 验证码。
 
 ## 权限和匹配页面
 
@@ -137,7 +137,7 @@ email----password----client_id----refresh_token
 
 插件请求的 host permissions 包含：
 
-- 本地 Outlook API：`127.0.0.1:8787`、`localhost:8787`
+- 临时邮箱 Worker API：用于 `/admin/new_address` 和 `/api/mails`
 - ChatGPT / OpenAI Auth / OpenAI Pay
 - PayPal
 - meiguodizhi 地址资料站点
@@ -166,7 +166,7 @@ pnpm zip
 
 ```text
 entrypoints/
-  background.ts          后台消息处理、Outlook 收码、checkout 创建
+  background.ts          后台消息处理、临时邮箱收码、checkout 创建
   content.ts             内容脚本入口，挂载右侧插件面板和自动填写模块
 src/
   app/                   面板主框架、状态、样式

@@ -4,8 +4,6 @@ import { parseSmsRelayTargets } from './parser';
 import { fetchSmsRelayCode } from './poller';
 import type { SmsCodeRecord, SmsRelayState, SmsRelayTarget } from './types';
 
-const POLL_INTERVAL_MS = 3_000;
-
 interface TargetRuntime {
   target: SmsRelayTarget;
   status: 'waiting' | 'found' | 'error';
@@ -36,7 +34,7 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
   const targetList = document.createElement('div');
   targetList.className = 'opx-sms-targets';
 
-  const historyTitle = createTitle('验证码历史');
+  const historyTitle = createTitle('最后一次验证码');
   const historyTable = document.createElement('div');
   historyTable.className = 'opx-sms-table';
 
@@ -45,7 +43,6 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
 
   const runtimeById = new Map<string, TargetRuntime>();
   let currentState: SmsRelayState | null = null;
-  let pollTimer: number | null = null;
   let lastSavedInput = '';
   let inputSaveTimer: number | null = null;
   let inputFocused = false;
@@ -106,7 +103,6 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
 
   const onShow = async () => {
     await update();
-    ensurePolling();
   };
 
   void update();
@@ -131,13 +127,6 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
     currentState = await saveSmsRelayState({ rawInput });
     lastSavedInput = rawInput;
     renderSummary();
-  }
-
-  function ensurePolling(): void {
-    if (pollTimer !== null) {
-      return;
-    }
-    pollTimer = window.setInterval(() => void pollAllTargets(), POLL_INTERVAL_MS);
   }
 
   function renderTargetsFromInput(): void {
@@ -181,7 +170,7 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
     if (parsed.errors.length) {
       setStatus(status, parsed.errors.join('；'), 'error');
     } else if (parsed.targets.length) {
-      setStatus(status, `已加载 ${parsed.targets.length} 个接码链接，每 3 秒自动获取。`, 'pending');
+      setStatus(status, `已加载 ${parsed.targets.length} 个接码链接，点击“立即获取”手动获取。`, 'pending');
     } else {
       setStatus(status, '输入内容会自动保存。', 'pending');
     }
@@ -190,9 +179,9 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
 
   function renderSummary(): void {
     const parsed = parseSmsRelayTargets(input.value);
-    const historyCount = currentState?.history.length || 0;
+    const historyCount = currentState?.history.length ? 1 : 0;
     const foundCount = [...runtimeById.values()].filter((item) => item.code).length;
-    summary.textContent = `${parsed.targets.length} 个接码链接 · ${foundCount} 个当前验证码 · ${historyCount} 条历史`;
+    summary.textContent = `${parsed.targets.length} 个接码链接 · ${foundCount} 个当前验证码 · ${historyCount} 条最近记录`;
   }
 
   async function pollAllTargets(): Promise<void> {
@@ -257,7 +246,7 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
       message,
       receivedAt: Date.now(),
     };
-    const nextHistory = [record, ...state.history].slice(0, 80);
+    const nextHistory = [record];
     currentState = await saveSmsRelayState({ history: nextHistory });
   }
 
@@ -301,7 +290,7 @@ export function createSmsPanel(container: HTMLElement): FeaturePanelHandle {
       return;
     }
 
-    for (const item of history) {
+    for (const item of history.slice(0, 1)) {
       const row = document.createElement('div');
       row.className = 'opx-sms-table-row';
       const codeButton = document.createElement('button');

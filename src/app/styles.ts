@@ -474,6 +474,14 @@ export const PANEL_STYLES = `
   line-height: 15px;
 }
 
+.opx-setting-section-title {
+  margin: 10px 0 6px;
+  color: #bbf7d0;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 16px;
+}
+
 .opx-external-link-button {
   box-sizing: border-box;
   display: inline-flex;

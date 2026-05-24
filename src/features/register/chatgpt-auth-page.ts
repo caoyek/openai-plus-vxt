@@ -13,7 +13,10 @@ const SUBMIT_SELECTORS = [
 ];
 
 export function isChatGptLoginPage(): boolean {
-  return location.hostname === 'chatgpt.com' && location.pathname.startsWith('/auth/login');
+  if (!isOpenAiAuthHost()) {
+    return false;
+  }
+  return Boolean(findFirst<HTMLInputElement>(EMAIL_SELECTORS));
 }
 
 export async function fillEmailAndContinue(email: string): Promise<ActionResult> {
@@ -62,11 +65,23 @@ function findSubmitButton(): HTMLButtonElement | null {
 function findFirst<T extends Element>(selectors: string[]): T | null {
   for (const selector of selectors) {
     const element = document.querySelector<T>(selector);
-    if (element) {
+    if (element && isVisible(element)) {
       return element;
     }
   }
   return null;
+}
+
+function isOpenAiAuthHost(): boolean {
+  return location.hostname === 'chatgpt.com' ||
+    location.hostname === 'auth.openai.com' ||
+    location.hostname === 'chat.openai.com';
+}
+
+function isVisible(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
 }
 
 function setNativeValue(input: HTMLInputElement, value: string): void {

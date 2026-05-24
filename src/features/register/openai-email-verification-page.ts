@@ -9,7 +9,10 @@ const OTP_SELECTORS = [
 ];
 
 export function isEmailVerificationPage(): boolean {
-  return location.hostname === 'auth.openai.com' && location.pathname.startsWith('/email-verification');
+  if (!isOpenAiAuthHost()) {
+    return false;
+  }
+  return Boolean(findOtpInput()) && includesAny(pageText(), ['code', 'otp', 'verification', '验证码', '验证']);
 }
 
 export async function fillOtpAndContinue(code: string): Promise<ActionResult> {
@@ -49,13 +52,16 @@ export async function fillOtpAndContinue(code: string): Promise<ActionResult> {
 function findOtpInput(): HTMLInputElement | null {
   for (const selector of OTP_SELECTORS) {
     const input = document.querySelector<HTMLInputElement>(selector);
-    if (input) {
+    if (input && isVisible(input)) {
       return input;
     }
   }
 
   const candidates = Array.from(document.querySelectorAll<HTMLInputElement>('input'));
   return candidates.find((input) => {
+    if (!isVisible(input)) {
+      return false;
+    }
     const label = [
       input.placeholder,
       input.ariaLabel,
@@ -64,6 +70,26 @@ function findOtpInput(): HTMLInputElement | null {
     ].join(' ').toLowerCase();
     return label.includes('code') || label.includes('otp') || label.includes('验证');
   }) ?? null;
+}
+
+function isOpenAiAuthHost(): boolean {
+  return location.hostname === 'chatgpt.com' ||
+    location.hostname === 'auth.openai.com' ||
+    location.hostname === 'chat.openai.com';
+}
+
+function pageText(): string {
+  return (document.body?.innerText || document.body?.textContent || '').toLowerCase();
+}
+
+function isVisible(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+}
+
+function includesAny(text: string, values: string[]): boolean {
+  return values.some((value) => text.includes(value));
 }
 
 function findContinueButton(): HTMLButtonElement | null {

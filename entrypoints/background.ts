@@ -3,7 +3,7 @@ import type { RandomAddressMessage } from '../src/features/address-autofill/type
 import { createCheckoutLink } from '../src/features/link-extractor/checkout';
 import { fetchChatGptSession } from '../src/features/link-extractor/session';
 import type { ChatGptSessionMessage, ChatGptSessionResponse, CheckoutLinkMessage } from '../src/features/link-extractor/types';
-import type { OutlookOtpMessage, OutlookOtpResponse } from '../src/features/register/types';
+import type { OutlookOtpMessage, OutlookOtpResponse, TempMailAddressMessage } from '../src/features/register/types';
 import type { SmsRelayFetchMessage, SmsRelayFetchResponse } from '../src/features/sms/types';
 
 type MessageSenderLike = {
@@ -12,12 +12,21 @@ type MessageSenderLike = {
   };
 };
 
-const DEFAULT_OUTLOOK_API_BASE = 'http://127.0.0.1:8787';
+type ExternalPayLinkMessage = {
+  type: 'opx:run-pay-link';
+  pay?: string;
+  url?: string;
+  link?: string;
+  paymentLink?: string;
+  incognito?: boolean;
+};
+
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_INTERVAL_MS = 5_000;
 const ASSISTANT_SCRIPT_FILE = '/content-scripts/content.js';
 const ASSISTANT_URL_PREFIXES = [
   'https://chatgpt.com/',
+  'https://chat.openai.com/',
   'https://auth.openai.com/',
   'https://pay.openai.com/',
   'https://www.paypal.com/',
@@ -27,8 +36,18 @@ const ASSISTANT_URL_PREFIXES = [
 export default defineBackground(() => {
   installAssistantInjector();
 
+  browser.runtime.onMessageExternal.addListener((message: unknown) => {
+    if (isExternalPayLinkMessage(message)) {
+      return openExternalPayLink(message);
+    }
+    return undefined;
+  });
+
   browser.runtime.onMessage.addListener((message: unknown, sender) => {
     if (!isOutlookOtpMessage(message)) {
+      if (isExternalPayLinkMessage(message)) {
+        return openExternalPayLink(message);
+      }
       if (isCheckoutLinkMessage(message)) {
         return createCheckoutLink(message.raw, message.options);
       }
@@ -41,12 +60,41 @@ export default defineBackground(() => {
       if (isSmsRelayFetchMessage(message)) {
         return fetchSmsRelay(message.url);
       }
+      if (isTempMailAddressMessage(message)) {
+        return createTempMailAddress(message.accountLine);
+      }
       return undefined;
     }
 
     return waitForOutlookOtp(message);
   });
 });
+
+async function openExternalPayLink(message: ExternalPayLinkMessage): Promise<{ ok: boolean; message: string; url?: string }> {
+  const raw = message.pay || message.url || message.link || message.paymentLink || '';
+  const normalized = normalizePaymentUrl(raw);
+  if (!normalized.ok) {
+    return normalized;
+  }
+
+  try {
+    if (message.incognito) {
+      await browser.windows.create({ url: normalized.url, incognito: true, focused: true });
+    } else {
+      await browser.tabs.create({ url: normalized.url, active: true });
+    }
+    return {
+      ok: true,
+      message: '已打开支付长链',
+      url: normalized.url,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: `打开支付长链失败：${String(error)}`,
+    };
+  }
+}
 
 async function fetchChatGptSessionForSender(sender: MessageSenderLike): Promise<ChatGptSessionResponse> {
   const tabId = sender.tab?.id;
@@ -184,14 +232,56 @@ function isAssistantUrl(url: string | undefined): boolean {
   return ASSISTANT_URL_PREFIXES.some((prefix) => url?.startsWith(prefix));
 }
 
+function isExternalPayLinkMessage(value: unknown): value is ExternalPayLinkMessage {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const message = value as Partial<ExternalPayLinkMessage>;
+  return message.type === 'opx:run-pay-link' &&
+    typeof (message.pay || message.url || message.link || message.paymentLink || '') === 'string';
+}
+
+function normalizePaymentUrl(raw: string): { ok: true; url: string } | { ok: false; message: string } {
+  if (!raw.trim()) {
+    return { ok: false, message: '缺少支付长链参数' };
+  }
+  try {
+    const url = new URL(raw.trim());
+    if (url.protocol !== 'https:') {
+      return { ok: false, message: '支付链接必须是 https 地址' };
+    }
+    if (!isSupportedPaymentHost(url.hostname)) {
+      return { ok: false, message: '只支持 OpenAI / ChatGPT / PayPal / Stripe 支付链接' };
+    }
+    return { ok: true, url: url.toString() };
+  } catch {
+    return { ok: false, message: '支付链接格式无效' };
+  }
+}
+
+function isSupportedPaymentHost(hostname: string): boolean {
+  return hostname === 'pay.openai.com' ||
+    hostname === 'chatgpt.com' ||
+    hostname === 'chat.openai.com' ||
+    hostname.endsWith('paypal.com') ||
+    hostname.endsWith('stripe.com') ||
+    hostname.endsWith('stripe.com.cn');
+}
+
 async function waitForOutlookOtp(message: OutlookOtpMessage): Promise<OutlookOtpResponse> {
   const startedAt = message.since ?? Date.now();
   const deadline = Date.now() + (message.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const intervalMs = message.intervalMs ?? DEFAULT_INTERVAL_MS;
-  const apiBase = normalizeApiBase(message.apiBase || DEFAULT_OUTLOOK_API_BASE);
+  const account = parseTempMailAccountLine(message.accountLine);
+  if (!account.ok) {
+    return {
+      ok: false,
+      message: account.message,
+    };
+  }
 
   while (Date.now() <= deadline) {
-    const result = await fetchLatestOtp(apiBase, message.accountLine, startedAt);
+    const result = await fetchLatestTempMailOtp(account, startedAt);
     if (result.ok && result.code) {
       return result;
     }
@@ -203,34 +293,26 @@ async function waitForOutlookOtp(message: OutlookOtpMessage): Promise<OutlookOtp
 
   return {
     ok: false,
-    message: '等待 Outlook 验证码超时',
+    message: '等待临时邮箱验证码超时',
   };
 }
 
-async function fetchLatestOtp(
-  apiBase: string,
-  accountLine: string,
+async function fetchLatestTempMailOtp(
+  account: TempMailAccount,
   startedAt: number,
 ): Promise<OutlookOtpResponse & { fatal?: boolean }> {
   let response: Response;
   try {
-    response = await fetch(`${apiBase}/api/outlook/fetch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        account_line: accountLine,
-        limit: 10,
-        mailbox: 'default',
-        query: 'OpenAI',
-        unseen_only: false,
-        mark_seen: false,
-      }),
+    response = await fetch(`${account.apiBase}/api/mails?limit=10&offset=0`, {
+      method: 'GET',
+      headers: tempMailAuthHeaders(account),
+      cache: 'no-store',
     });
   } catch (error) {
     return {
       ok: false,
       fatal: true,
-      message: `无法连接 Outlook 本地 API：${String(error)}`,
+      message: `无法连接临时邮箱 API：${String(error)}`,
     };
   }
 
@@ -239,35 +321,96 @@ async function fetchLatestOtp(
     return {
       ok: false,
       fatal: true,
-      message: `Outlook API 返回 ${response.status}：${detail}`,
+      message: `临时邮箱 API 返回 ${response.status}：${detail}`,
     };
   }
 
-  const payload = await response.json() as OutlookFetchPayload;
-  const startedAtSeconds = startedAt / 1000;
-  const messages = [...(payload.messages || [])].sort(
-    (a, b) => Number(b.received_at || 0) - Number(a.received_at || 0),
-  );
+  const payload = await response.json();
+  const messages = extractTempMailMessages(payload)
+    .map(normalizeTempMailMessage)
+    .sort((a, b) => b.receivedAt - a.receivedAt);
 
   const fresh = messages.find((item) => {
-    if (!item.otp) {
+    if (!item.code) {
       return false;
     }
-    const receivedAt = Number(item.received_at || 0);
-    return !receivedAt || receivedAt >= startedAtSeconds - 15;
+    return !item.receivedAt || item.receivedAt >= startedAt - 15_000;
   });
 
-  if (!fresh?.otp) {
+  if (!fresh?.code) {
     return {
       ok: false,
-      message: '暂未收到新的 Outlook 验证码',
+      message: '暂未收到新的临时邮箱验证码',
     };
   }
 
   return {
     ok: true,
-    code: fresh.otp,
-    message: `收到验证码：${fresh.otp}`,
+    code: fresh.code,
+    message: `收到验证码：${fresh.code}`,
+  };
+}
+
+async function createTempMailAddress(accountLine: string): Promise<OutlookOtpResponse> {
+  const request = parseTempMailNewAddressLine(accountLine);
+  if (!request.ok) {
+    return {
+      ok: false,
+      message: request.message,
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${request.apiBase}/admin/new_address`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-auth': request.adminAuth,
+        ...(request.customAuth ? { 'x-custom-auth': request.customAuth } : {}),
+      },
+      body: JSON.stringify({
+        enablePrefix: true,
+        name: request.name || randomMailboxName(),
+        domain: request.domain,
+      }),
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      message: `无法连接临时邮箱创建接口：${String(error)}`,
+    };
+  }
+
+  if (!response.ok) {
+    const detail = await readResponseDetail(response);
+    return {
+      ok: false,
+      message: `临时邮箱创建接口返回 ${response.status}：${detail}`,
+    };
+  }
+
+  const payload = await response.json() as TempMailNewAddressPayload;
+  const email = String(payload.address || '').trim();
+  const jwt = String(payload.jwt || '').trim();
+  if (!email || !jwt) {
+    return {
+      ok: false,
+      message: '临时邮箱创建接口没有返回 address/jwt',
+    };
+  }
+
+  const accountLineOut = [
+    email,
+    jwt,
+    request.apiBase,
+    request.customAuth,
+  ].filter(Boolean).join('----');
+  return {
+    ok: true,
+    email,
+    accountLine: accountLineOut,
+    message: `已创建临时邮箱：${email}`,
   };
 }
 
@@ -277,6 +420,15 @@ function isOutlookOtpMessage(message: unknown): message is OutlookOtpMessage {
       typeof message === 'object' &&
       (message as OutlookOtpMessage).type === 'opx:wait-outlook-otp' &&
       typeof (message as OutlookOtpMessage).accountLine === 'string',
+  );
+}
+
+function isTempMailAddressMessage(message: unknown): message is TempMailAddressMessage {
+  return Boolean(
+    message &&
+      typeof message === 'object' &&
+      (message as TempMailAddressMessage).type === 'opx:create-temp-mail-address' &&
+      typeof (message as TempMailAddressMessage).accountLine === 'string',
   );
 }
 
@@ -404,14 +556,18 @@ async function readSmsRelayResponse(response: Response): Promise<{ parsed: unkno
   }
 }
 
-function normalizeApiBase(value: string): string {
-  return value.replace(/\/+$/, '');
-}
-
 async function readResponseDetail(response: Response): Promise<string> {
   try {
-    const data = await response.json() as { detail?: string };
-    return data.detail || response.statusText;
+    const text = await response.text();
+    if (!text) {
+      return response.statusText;
+    }
+    try {
+      const data = JSON.parse(text) as { detail?: string; message?: string; error?: string };
+      return data.detail || data.message || data.error || shortenDetail(text);
+    } catch {
+      return shortenDetail(text);
+    }
   } catch {
     return response.statusText;
   }
@@ -423,6 +579,10 @@ function delay(ms: number): Promise<void> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object');
+}
+
+function shortenDetail(text: string, limit = 400): string {
+  return String(text || '').replace(/\s+/g, ' ').slice(0, limit);
 }
 
 function isSmsRelaySuccessPayload(value: Record<string, unknown>): boolean {
@@ -445,9 +605,217 @@ function isSmsRelaySuccessPayload(value: Record<string, unknown>): boolean {
   return code === 0 || code === 1 || code === 200;
 }
 
-interface OutlookFetchPayload {
-  messages?: Array<{
-    otp?: string;
-    received_at?: number;
-  }>;
+function parseTempMailAccountLine(accountLine: string): TempMailAccountParseResult {
+  const parts = accountLine.split('----').map((item) => item.trim());
+  if (parts.length < 3) {
+    return { ok: false, message: '临时邮箱账号行需要 email----地址JWT----Worker地址' };
+  }
+  const email = parts[0];
+  const jwt = parts[1];
+  const apiBase = normalizeTempMailApiBase(parts[2]);
+  if (!email || !jwt || !apiBase) {
+    return { ok: false, message: '临时邮箱账号行缺少邮箱、地址 JWT 或 Worker 地址' };
+  }
+  return {
+    ok: true,
+    email,
+    jwt,
+    apiBase,
+    customAuth: parts[3] || '',
+  };
+}
+
+function parseTempMailNewAddressLine(accountLine: string): TempMailNewAddressParseResult {
+  const parts = accountLine.split('----').map((item) => item.trim());
+  const apiBase = normalizeTempMailApiBase(parts[0] || '');
+  if (!apiBase || parts.length < 3 || !parts[1] || !parts[2]) {
+    return { ok: false, message: '新建临时邮箱需要 Worker地址----admin_auth----邮箱域名' };
+  }
+  return {
+    ok: true,
+    apiBase,
+    adminAuth: parts[1],
+    domain: parts[2],
+    name: parts[3] || '',
+    customAuth: parts[4] || '',
+  };
+}
+
+function normalizeTempMailApiBase(value: string): string {
+  try {
+    const url = new URL(value.replace(/\/+$/, ''));
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return '';
+    }
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function tempMailAuthHeaders(account: TempMailAccount): Record<string, string> {
+  return {
+    Authorization: `Bearer ${account.jwt}`,
+    'Content-Type': 'application/json',
+    ...(account.customAuth ? { 'x-custom-auth': account.customAuth } : {}),
+  };
+}
+
+function extractTempMailMessages(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  if (!isRecord(payload)) {
+    return [];
+  }
+  for (const key of ['mails', 'messages', 'data', 'items', 'results']) {
+    const value = payload[key];
+    if (Array.isArray(value)) {
+      return value;
+    }
+    if (isRecord(value)) {
+      const nested = extractTempMailMessages(value);
+      if (nested.length) {
+        return nested;
+      }
+    }
+  }
+  return [];
+}
+
+function normalizeTempMailMessage(value: unknown): NormalizedTempMailMessage {
+  const source = isRecord(value) ? value : {};
+  const text = collectMailText(source);
+  return {
+    code: extractOpenAiOtp(text),
+    receivedAt: extractMailReceivedAt(source, text),
+  };
+}
+
+function collectMailText(source: Record<string, unknown>): string {
+  const chunks = [
+    stringValueFromRecord(source, 'subject'),
+    stringValueFromRecord(source, 'from'),
+    stringValueFromRecord(source, 'to'),
+    stringValueFromRecord(source, 'text'),
+    stringValueFromRecord(source, 'html'),
+    stringValueFromRecord(source, 'body'),
+    stringValueFromRecord(source, 'content'),
+    stringValueFromRecord(source, 'source'),
+    stringValueFromRecord(source, 'raw'),
+  ];
+  const raw = chunks.join('\n');
+  return [
+    raw,
+    decodeQuotedPrintable(raw),
+    ...decodeBase64MailParts(raw),
+  ].join('\n');
+}
+
+function extractMailReceivedAt(source: Record<string, unknown>, text: string): number {
+  for (const key of ['received_at', 'receivedAt', 'created_at', 'createdAt', 'date', 'time', 'timestamp']) {
+    const value = source[key];
+    const parsed = parseMailTimestamp(value);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const dateHeader = /^date:\s*(.+)$/im.exec(text);
+  return dateHeader?.[1] ? parseMailTimestamp(dateHeader[1]) : 0;
+}
+
+function parseMailTimestamp(value: unknown): number {
+  if (typeof value === 'number') {
+    return value > 1_000_000_000_000 ? value : value * 1000;
+  }
+  if (typeof value !== 'string' || !value.trim()) {
+    return 0;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return parseMailTimestamp(numeric);
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function extractOpenAiOtp(text: string): string {
+  const normalized = text.replace(/=\r?\n/g, '').replace(/\s+/g, ' ');
+  const openAiWindow = /(openai|chatgpt|verify|verification|验证码|安全代码).{0,180}?(\d{4,8})/i.exec(normalized);
+  if (openAiWindow?.[2]) {
+    return openAiWindow[2];
+  }
+  const generic = /\b\d{4,8}\b/.exec(normalized);
+  return generic?.[0] || '';
+}
+
+function decodeQuotedPrintable(value: string): string {
+  return value
+    .replace(/=\r?\n/g, '')
+    .replace(/=([0-9A-F]{2})/gi, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+}
+
+function decodeBase64MailParts(value: string): string[] {
+  const decoded: string[] = [];
+  const base64Blocks = value.match(/(?:[A-Za-z0-9+/]{40,}={0,2}\r?\n?){1,}/g) || [];
+  for (const block of base64Blocks.slice(0, 10)) {
+    const compact = block.replace(/\s+/g, '');
+    try {
+      decoded.push(decodeURIComponent(escape(atob(compact))));
+    } catch {
+      try {
+        decoded.push(atob(compact));
+      } catch {
+        // Ignore non-body base64 fragments.
+      }
+    }
+  }
+  return decoded;
+}
+
+function stringValueFromRecord(source: Record<string, unknown>, key: string): string {
+  const value = source[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function randomMailboxName(): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz';
+  const letters = Array.from({ length: 8 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+  const digits = String(Math.floor(1000 + Math.random() * 9000));
+  return `${letters}${digits}`;
+}
+
+type TempMailAccountParseResult =
+  | (TempMailAccount & { ok: true })
+  | { ok: false; message: string };
+
+interface TempMailAccount {
+  email: string;
+  jwt: string;
+  apiBase: string;
+  customAuth: string;
+}
+
+type TempMailNewAddressParseResult =
+  | (TempMailNewAddressRequest & { ok: true })
+  | { ok: false; message: string };
+
+interface TempMailNewAddressRequest {
+  apiBase: string;
+  adminAuth: string;
+  domain: string;
+  name: string;
+  customAuth: string;
+}
+
+interface TempMailNewAddressPayload {
+  jwt?: string;
+  address?: string;
+  address_id?: number;
+}
+
+interface NormalizedTempMailMessage {
+  code: string;
+  receivedAt: number;
 }

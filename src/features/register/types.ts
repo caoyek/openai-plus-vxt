@@ -39,6 +39,7 @@ export interface ParsedAccountInput {
   mode: AccountInputMode;
   email: string;
   accountLine: string;
+  apiBase?: string;
   message: string;
 }
 
@@ -55,4 +56,11 @@ export interface OutlookOtpResponse {
   ok: boolean;
   message: string;
   code?: string;
+  email?: string;
+  accountLine?: string;
+}
+
+export interface TempMailAddressMessage {
+  type: 'opx:create-temp-mail-address';
+  accountLine: string;
 }

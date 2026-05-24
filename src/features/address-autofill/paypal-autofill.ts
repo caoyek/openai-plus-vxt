@@ -1,5 +1,7 @@
-import { loadRegisterState } from '../../app/state';
+import { loadRegisterState, loadSmsRelayState } from '../../app/state';
 import { parseAccountInput } from '../register/account-input';
+import { parseSmsRelayTargets } from '../sms/parser';
+import { fetchSmsRelayCode } from '../sms/poller';
 import { loadAddressAutofillSettings, saveAddressAutofillSettings } from '../settings/state';
 import type { AddressAutofillSettings } from '../settings/types';
 import type { AddressProfile, RandomAddressResponse } from './types';
@@ -7,6 +9,8 @@ import type { AddressProfile, RandomAddressResponse } from './types';
 const LOG_PREFIX = '[OPX PayPal Autofill]';
 const PAYPAL_ADDRESS_SESSION_KEY = 'opx.paypal.autofill.address';
 const PAYPAL_PENDING_MANUAL_KEY = 'opx.paypal.autofill.pendingManual';
+const PAYPAL_GUEST_EMAIL_KEY = 'opx.paypal.guest.email';
+const PAYPAL_PASSWORD_KEY = 'opx.paypal.signup.password';
 const PAYPAL_FILLED_ATTR = 'data-opx-paypal-filled';
 const PAYPAL_RANDOM_BUTTON_ID = 'opx-paypal-random-fill';
 const MAX_AUTOFILL_ATTEMPTS_PER_PAGE = 3;
@@ -43,13 +47,40 @@ let observer: MutationObserver | null = null;
 let attemptKey = '';
 let attemptCount = 0;
 let manualFillKey = '';
+let payEmailTimer: number | null = null;
+let payEmailRunning = false;
+let payOtpTimer: number | null = null;
+let payOtpRunning = false;
+let consentClicked = false;
+let consentAttempts = 0;
+let consentTimer: number | null = null;
+let reviewSubmitClicked = false;
+let reviewSubmitTimer: number | null = null;
+let reviewSubmitAllowedAt = 0;
 
 export function initPaypalAutofill(): void {
-  if (initialized || !isPaypalSignupPage()) {
+  if (initialized || !isPaypalAutomationPage()) {
     return;
   }
 
   initialized = true;
+  installConsentObserver();
+  scheduleConsentClick(1200);
+  startConsentWatcher();
+  if (isPaypalOtpPage()) {
+    installPayOtpObserver();
+    schedulePayOtpFill(1600);
+    return;
+  }
+  if (isPaypalPayEmailFlowPage()) {
+    installPayEmailFlowObserver();
+    schedulePayEmailFlow(1200);
+    return;
+  }
+  if (isPaypalConsentPage()) {
+    return;
+  }
+
   installRandomFillButton();
   installStorageListener();
   installObserver();
@@ -57,6 +88,73 @@ export function initPaypalAutofill(): void {
     scheduleManualSessionAutofill(900);
   } else {
     scheduleAutofill(800);
+  }
+}
+
+async function runPayEmailFlow(): Promise<void> {
+  if (payEmailRunning || !isPaypalPayEmailFlowPage()) {
+    return;
+  }
+
+  payEmailRunning = true;
+  try {
+    const email = getOrCreateGuestEmail();
+    const firstEmail = document.querySelector<HTMLInputElement>('input#email[name="login_email"], input#email[type="email"]');
+    if (firstEmail && isVisible(firstEmail)) {
+      setNativeValue(firstEmail, email);
+      await delay(1200);
+      const createButton = findPaypalCreateAccountButton();
+      if (createButton && !createButton.disabled) {
+        createButton.click();
+        return;
+      }
+    }
+
+    const loginEmail = document.querySelector<HTMLInputElement>('input#login_email[name="login_email"], input#login_email[type="email"]');
+    if (loginEmail && isVisible(loginEmail)) {
+      setNativeValue(loginEmail, email);
+      await delay(1200);
+      const continueButton = findPaypalContinuePaymentButton();
+      if (continueButton && !continueButton.disabled) {
+        continueButton.click();
+      }
+    }
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} pay email flow failed`, error);
+  } finally {
+    payEmailRunning = false;
+  }
+}
+
+async function runPayOtpFill(): Promise<void> {
+  if (payOtpRunning || !isPaypalOtpPage()) {
+    return;
+  }
+  payOtpRunning = true;
+  try {
+    const inputs = findPaypalOtpInputs();
+    const expectedLength = expectedOtpLength(inputs);
+    if (expectedLength !== 6 || inputs.length < 6 || inputs.every((input) => input.value.trim())) {
+      return;
+    }
+
+    const code = await fetchLatestSmsCodeForPaypal();
+    if (!code) {
+      schedulePayOtpFill(3500);
+      return;
+    }
+
+    await fillOtpInputsSlowly(inputs.slice(0, 6), code);
+    await delay(900);
+    const button = findPaypalOtpContinueButton();
+    if (button && !button.disabled && isVisible(button)) {
+      clickElement(button);
+      scheduleConsentClick(2600);
+    }
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} OTP fill failed`, error);
+  } finally {
+    payOtpRunning = false;
   }
 }
 
@@ -84,6 +182,10 @@ export async function fillPaypalAddressNow(
     resetAttempts();
   }
   const result = await fillPaypalSignupFields(targetAddress, allowRetry);
+  if (!result.countryChanged) {
+    reviewSubmitAllowedAt = Date.now() + 900;
+    scheduleReviewSubmitClick(1800);
+  }
   noteAttempt(targetAddress, result.countryChanged, allowRetry);
   if (force && !allowRetry) {
     manualFillKey = pageAttemptKey(targetAddress);
@@ -174,13 +276,15 @@ async function fillPaypalSignupFields(address: AddressProfile, allowRetry: boole
   }
 
   const email = await resolveEmail(address);
+  const phone = await resolveSmsPhone(address.phone);
+  const password = getOrCreatePaypalPassword();
   const name = splitName(address.fullName);
   const expiry = parseExpiry(address.creditCard.expires);
 
   filled += fillText(PAYPAL_FIELDS.email, email, true);
-  filled += fillPasswordField(email);
-  renderPasswordEmailNote(email);
-  filled += fillText(PAYPAL_FIELDS.phone, address.phone, true);
+  filled += fillPasswordField(password);
+  renderPasswordNote(password);
+  filled += fillText(PAYPAL_FIELDS.phone, phone, true);
   filled += fillText(PAYPAL_FIELDS.cardNumber, address.creditCard.number, true);
   filled += fillText(PAYPAL_FIELDS.expiry, expiry.short, true);
   filled += fillText(PAYPAL_FIELDS.csc, address.creditCard.cvv, true);
@@ -279,16 +383,16 @@ function fillPasswordField(value: string): number {
   return 1;
 }
 
-function renderPasswordEmailNote(email: string): void {
+function renderPasswordNote(password: string): void {
   const anchor = findPasswordDisclaimerAnchor();
   if (!anchor) {
     return;
   }
 
-  fillPasswordField(email);
+  fillPasswordField(password);
 
   const noteId = 'opx-paypal-password-note';
-  const text = `当前密码和邮箱一致（${email}）`;
+  const text = `当前密码：${password}`;
   let note = document.getElementById(noteId);
   if (!note) {
     note = document.createElement('div');
@@ -349,6 +453,25 @@ function fillBillingAddressGroup(address: AddressProfile, name: { first: string;
   filled += fillGroupSelectOrInput(group, ['state', 'province', 'region'], address.state, [address.stateFull, address.state], fallbackControls[5]);
   filled += fillGroupText(group, ['zip', 'postal code', 'postcode'], address.postalCode, fallbackControls[6]);
   return filled;
+}
+
+async function resolveSmsPhone(fallback: string): Promise<string> {
+  try {
+    const state = await loadSmsRelayState();
+    const firstLine = state.rawInput.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || '';
+    const phone = firstLine.split('----')[0]?.trim();
+    return normalizePaypalPhone(phone) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizePaypalPhone(value: string): string {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) {
+    return digits.slice(1);
+  }
+  return digits || String(value || '').trim();
 }
 
 function fillGroupText(
@@ -636,6 +759,48 @@ function emitChange(element: HTMLElement): void {
   element.dispatchEvent(new Event('blur', { bubbles: true }));
 }
 
+function clickElement(element: HTMLElement): void {
+  element.scrollIntoView({ block: 'center', inline: 'center' });
+  element.focus?.();
+  element.click();
+  const rect = element.getBoundingClientRect();
+  const clientX = rect.left + rect.width / 2;
+  const clientY = rect.top + rect.height / 2;
+  const centerTarget = rect.width > 0 && rect.height > 0 ? document.elementFromPoint(clientX, clientY) : null;
+  if (centerTarget instanceof HTMLElement && centerTarget !== element) {
+    centerTarget.focus?.();
+    centerTarget.click();
+  }
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    const EventCtor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+    element.dispatchEvent(new EventCtor(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: 0,
+      buttons: type.endsWith('down') ? 1 : 0,
+      clientX,
+      clientY,
+      pointerId: 1,
+      pointerType: 'mouse',
+    }));
+    if (centerTarget instanceof HTMLElement && centerTarget !== element) {
+      centerTarget.dispatchEvent(new EventCtor(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 0,
+        buttons: type.endsWith('down') ? 1 : 0,
+        clientX,
+        clientY,
+        pointerId: 1,
+        pointerType: 'mouse',
+      }));
+    }
+  }
+  element.click();
+}
+
 function installObserver(): void {
   observer?.disconnect();
   observer = new MutationObserver(() => {
@@ -907,6 +1072,132 @@ function scheduleAutofill(delayMs: number): void {
   }, delayMs);
 }
 
+function installPayEmailFlowObserver(): void {
+  observer?.disconnect();
+  observer = new MutationObserver(() => schedulePayEmailFlow(900));
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+function schedulePayEmailFlow(delayMs: number): void {
+  if (payEmailTimer) {
+    window.clearTimeout(payEmailTimer);
+  }
+  payEmailTimer = window.setTimeout(() => {
+    payEmailTimer = null;
+    void runPayEmailFlow();
+  }, delayMs);
+}
+
+function installPayOtpObserver(): void {
+  observer?.disconnect();
+  observer = new MutationObserver(() => schedulePayOtpFill(1200));
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+function schedulePayOtpFill(delayMs: number): void {
+  if (payOtpTimer) {
+    window.clearTimeout(payOtpTimer);
+  }
+  payOtpTimer = window.setTimeout(() => {
+    payOtpTimer = null;
+    void runPayOtpFill();
+  }, delayMs);
+}
+
+function installConsentObserver(): void {
+  const consentObserver = new MutationObserver(() => {
+    scheduleConsentClick(900);
+    if (isPaypalOtpPage()) {
+      schedulePayOtpFill(1200);
+    }
+    if (reviewSubmitAllowedAt > 0) {
+      scheduleReviewSubmitClick(1400);
+    }
+  });
+  consentObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+function startConsentWatcher(): void {
+  if (consentTimer) {
+    return;
+  }
+  consentTimer = window.setInterval(() => {
+    if (consentClicked && !findPaypalConsentButton()) {
+      stopConsentWatcher();
+      return;
+    }
+    scheduleConsentClick(0);
+  }, 1800);
+}
+
+function stopConsentWatcher(): void {
+  if (consentTimer) {
+    window.clearInterval(consentTimer);
+    consentTimer = null;
+  }
+}
+
+function scheduleReviewSubmitClick(delayMs: number): void {
+  if (reviewSubmitClicked) {
+    return;
+  }
+  if (reviewSubmitTimer) {
+    window.clearTimeout(reviewSubmitTimer);
+  }
+  reviewSubmitTimer = window.setTimeout(() => {
+    reviewSubmitTimer = null;
+    if (!isPaypalReviewSubmitAllowed()) {
+      return;
+    }
+    const button = findPaypalReviewSubmitButton();
+    if (!button || button.disabled || !isVisible(button)) {
+      return;
+    }
+    reviewSubmitClicked = true;
+    clickElement(button);
+  }, delayMs);
+}
+
+function scheduleConsentClick(delayMs: number): void {
+  if (consentClicked && !findPaypalConsentButton()) {
+    return;
+  }
+  window.setTimeout(() => {
+    const button = findPaypalConsentButton();
+    if (!button || button.disabled) {
+      consentAttempts += 1;
+      if (consentAttempts < 80) {
+        scheduleConsentClick(1400);
+      }
+      return;
+    }
+    consentClicked = true;
+    clickElement(button);
+    button.form?.requestSubmit?.(button);
+    const row = button.closest<HTMLElement>('[data-ppui-info^="grid"], .hagrid-1kgc7wn-row, .hagrid-zwblip-row');
+    if (row) {
+      clickElement(row);
+    }
+    window.setTimeout(() => {
+      if (findPaypalConsentButton()) {
+        consentClicked = false;
+        scheduleConsentClick(900);
+      } else {
+        stopConsentWatcher();
+      }
+    }, 2500);
+  }, delayMs);
+}
+
 function cancelScheduledAutofill(): void {
   if (scheduledTimer) {
     window.clearTimeout(scheduledTimer);
@@ -1012,8 +1303,229 @@ function createOutlookEmail(address: AddressProfile): string {
   return `${base}${suffix}@outlook.com`;
 }
 
+function isPaypalAutomationPage(): boolean {
+  return isPaypalSignupPage() || isPaypalPayEmailFlowPage() || isPaypalOtpPage() || isPaypalConsentPage();
+}
+
+function isPaypalOtpPage(): boolean {
+  return location.hostname.endsWith('paypal.com') && findPaypalOtpInputs().length >= 4;
+}
+
+function isPaypalPayEmailFlowPage(): boolean {
+  return location.hostname.endsWith('paypal.com') &&
+    !isPaypalSignupPage() &&
+    (
+      location.pathname.startsWith('/pay') ||
+      Boolean(document.querySelector('input#email[name="login_email"], input#login_email[name="login_email"], button[data-testid="continueButton"]'))
+    );
+}
+
 function isPaypalSignupPage(): boolean {
   return location.hostname.endsWith('paypal.com') && location.pathname.startsWith('/checkoutweb/signup');
+}
+
+function isPaypalConsentPage(): boolean {
+  return location.hostname.endsWith('paypal.com') &&
+    (
+      location.pathname.startsWith('/webapps/hermes') ||
+      location.pathname.startsWith('/checkoutnow') ||
+      Boolean(document.querySelector('button#consentButton, button[data-testid="consentButton"]'))
+    );
+}
+
+function getOrCreateGuestEmail(): string {
+  const saved = sessionStorage.getItem(PAYPAL_GUEST_EMAIL_KEY);
+  if (saved && isEmail(saved)) {
+    return saved;
+  }
+  const email = `ppguest${Date.now().toString(36)}${randomDigits(4)}@gmail.com`;
+  sessionStorage.setItem(PAYPAL_GUEST_EMAIL_KEY, email);
+  return email;
+}
+
+function getOrCreatePaypalPassword(): string {
+  const saved = sessionStorage.getItem(PAYPAL_PASSWORD_KEY);
+  if (saved && /^[a-zA-Z0-9]{10}$/.test(saved)) {
+    return saved;
+  }
+  const password = randomAlphaNumeric(10);
+  sessionStorage.setItem(PAYPAL_PASSWORD_KEY, password);
+  return password;
+}
+
+function findPaypalCreateAccountButton(): HTMLButtonElement | null {
+  const exact = document.querySelector<HTMLButtonElement>(
+    'button[data-atomic-wait-task="login_create_account"][data-atomic-wait-viewname="email"]',
+  );
+  if (exact && isVisible(exact)) {
+    return exact;
+  }
+
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => {
+    const text = normalizedText(button.textContent || '');
+    return isVisible(button) && (text.includes('创建账户') || text.includes('create account'));
+  }) || null;
+}
+
+function findPaypalContinuePaymentButton(): HTMLButtonElement | null {
+  const exact = document.querySelector<HTMLButtonElement>('button[data-testid="continueButton"]');
+  if (exact && isVisible(exact)) {
+    return exact;
+  }
+
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => {
+    const text = normalizedText(button.textContent || '');
+    return isVisible(button) && (text.includes('继续付款') || text.includes('continue to payment'));
+  }) || null;
+}
+
+function findPaypalOtpInputs(): HTMLInputElement[] {
+  return Array.from(document.querySelectorAll<HTMLInputElement>(
+    'input[id^="ci-ciBasic-"], input[name^="ciBasic-"], input[type="tel"][aria-label*="-"]',
+  ))
+    .filter(isVisible)
+    .sort((a, b) => otpInputIndex(a) - otpInputIndex(b));
+}
+
+function expectedOtpLength(inputs: HTMLInputElement[]): number {
+  const lengths = inputs
+    .map((input) => {
+      const text = `${input.getAttribute('aria-label') || ''} ${input.name} ${input.id}`;
+      const labelMatch = /-\s*(\d+)/.exec(text);
+      if (labelMatch) {
+        return Number(labelMatch[1]);
+      }
+      const nameMatch = /ciBasic-(\d+)/.exec(text);
+      return nameMatch ? Number(nameMatch[1]) + 1 : 0;
+    })
+    .filter((length) => Number.isFinite(length) && length > 0);
+
+  if (normalizedText(document.body.textContent || '').includes('6-digit code')) {
+    return 6;
+  }
+  return Math.max(0, ...lengths);
+}
+
+function otpInputIndex(input: HTMLInputElement): number {
+  const text = `${input.name} ${input.id} ${input.getAttribute('aria-label') || ''}`;
+  const match = /(\d+)(?:-\d+)?/.exec(text);
+  return match ? Number(match[1]) : 0;
+}
+
+async function fetchLatestSmsCodeForPaypal(): Promise<string> {
+  const state = await loadSmsRelayState();
+  const parsed = parseSmsRelayTargets(state.rawInput);
+  const target = parsed.targets[0];
+  if (!target) {
+    return '';
+  }
+  const result = await fetchSmsRelayCode(target);
+  if (result.kind !== 'code') {
+    return '';
+  }
+  const digits = result.code.replace(/\D/g, '');
+  return digits.length === 6 ? digits : '';
+}
+
+async function fillOtpInputsSlowly(inputs: HTMLInputElement[], code: string): Promise<void> {
+  const digits = code.replace(/\D/g, '');
+  if (digits.length !== 6 || inputs.length < 6) {
+    return;
+  }
+  for (let index = 0; index < 6; index += 1) {
+    setNativeValue(inputs[index], digits[index]);
+    await delay(220);
+  }
+}
+
+function findPaypalOtpContinueButton(): HTMLButtonElement | null {
+  const candidates = Array.from(document.querySelectorAll<HTMLButtonElement>('button[type="submit"], button'))
+    .filter(isVisible);
+  return candidates.find((button) => {
+    const text = normalizedText(button.textContent || button.getAttribute('aria-label') || '');
+    return text.includes('继续') ||
+      text.includes('continue') ||
+      text.includes('verify') ||
+      text.includes('确认') ||
+      text.includes('submit');
+  }) || candidates.find((button) => !button.disabled) || null;
+}
+
+function findPaypalReviewSubmitButton(): HTMLButtonElement | null {
+  const exact = document.querySelector<HTMLButtonElement>(
+    'button[data-testid="submit-button"][data-atomic-wait-task="review_your_payment"], button[data-testid="submit-button"]',
+  );
+  if (exact && isVisible(exact)) {
+    return exact;
+  }
+
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('button[type="submit"], button')).find((button) => {
+    const text = normalizedText(button.textContent || button.getAttribute('aria-label') || '');
+    return isVisible(button) &&
+      !button.disabled &&
+      (
+        text.includes('agree & create account') ||
+        text.includes('agree and create account') ||
+        text.includes('create account') ||
+        text.includes('创建账户')
+      );
+  }) || null;
+}
+
+function findPaypalConsentButton(): HTMLButtonElement | null {
+  const exact = document.querySelector<HTMLButtonElement>('button#consentButton, button[data-testid="consentButton"]');
+  if (exact) {
+    return exact;
+  }
+  const rowButton = document.querySelector<HTMLButtonElement>('[data-ppui-info^="grid"] button[data-testid="consentButton"]');
+  if (rowButton) {
+    return rowButton;
+  }
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => {
+    const text = normalizedText(button.textContent || '');
+    return !button.disabled && (text.includes('agree and continue') || text.includes('同意并继续'));
+  }) || null;
+}
+
+function isPaypalReviewSubmitAllowed(): boolean {
+  if (!isPaypalSignupPage() || Date.now() < reviewSubmitAllowedAt) {
+    return false;
+  }
+
+  const button = findPaypalReviewSubmitButton();
+  if (!button || !isVisible(button)) {
+    return false;
+  }
+
+  return arePaypalSignupRequiredFieldsReady();
+}
+
+function arePaypalSignupRequiredFieldsReady(): boolean {
+  const textFields = [
+    PAYPAL_FIELDS.email,
+    PAYPAL_FIELDS.password,
+    PAYPAL_FIELDS.phone,
+    PAYPAL_FIELDS.cardNumber,
+    PAYPAL_FIELDS.expiry,
+    PAYPAL_FIELDS.csc,
+    PAYPAL_FIELDS.firstName,
+    PAYPAL_FIELDS.lastName,
+    PAYPAL_FIELDS.address1,
+    PAYPAL_FIELDS.city,
+    PAYPAL_FIELDS.postalCode,
+  ];
+
+  const readyTextFields = textFields.filter((selectors) => {
+    const input = findTextControl(selectors);
+    return input && isVisible(input) && Boolean(input.value.trim());
+  }).length;
+
+  const state = findSelect(PAYPAL_FIELDS.state) || findTextControl(PAYPAL_FIELDS.state);
+  const country = findSelect(PAYPAL_FIELDS.country);
+  const hasState = !state || !isVisible(state) || Boolean('value' in state && String(state.value || '').trim());
+  const hasCountry = !country || !isVisible(country) || Boolean(country.value.trim());
+
+  return readyTextFields >= 9 && hasState && hasCountry;
 }
 
 function isIgnoredInput(input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement): boolean {
@@ -1073,6 +1585,19 @@ function isEmail(value: string): boolean {
 
 function normalizedText(value: unknown): string {
   return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function randomDigits(length: number): string {
+  return Array.from({ length }, () => String(Math.floor(Math.random() * 10))).join('');
+}
+
+function randomAlphaNumeric(length: number): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  return Array.from({ length }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown): string {

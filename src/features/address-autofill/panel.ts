@@ -6,12 +6,6 @@ import { fillPayOpenAiAddressNow } from './pay-openai-autofill';
 import { fillPaypalAddressNow } from './paypal-autofill';
 import type { AddressProfile, RandomAddressResponse } from './types';
 
-interface AddressSection {
-  title: string;
-  collapsed?: boolean;
-  items: Array<{ label: string; value: string }>;
-}
-
 export function createAddressPanel(container: HTMLElement): FeaturePanelHandle {
   const summary = document.createElement('div');
   summary.className = 'opx-summary';
@@ -95,7 +89,7 @@ export function createAddressPanel(container: HTMLElement): FeaturePanelHandle {
       });
       renderSettings(next);
       const autofillMessage = await fillCurrentPaymentPage(response.address);
-      setStatus(status, autofillMessage ? `${response.message}；${autofillMessage}` : response.message, 'ok');
+      setStatus(status, autofillMessage ? `地址已获取并保存；${autofillMessage}` : '地址已获取并保存', 'ok');
     } catch (error) {
       setStatus(status, `获取地址失败：${errorMessage(error)}`, 'error');
     } finally {
@@ -132,127 +126,8 @@ export function createAddressPanel(container: HTMLElement): FeaturePanelHandle {
       currentList.append(createEmpty('暂无地址，点击“获取地址”。'));
       return;
     }
-
-    for (const section of addressSections(address)) {
-      currentList.append(createSection(section));
-    }
+    currentList.append(createEmpty(`已保存 ${address.countryLabel || address.countryCode} 地址，用于支付页填写。`));
   }
-
-  function createCopyRow(label: string, value: string): HTMLButtonElement {
-    const row = document.createElement('button');
-    row.className = 'opx-copy-row';
-    row.type = 'button';
-    row.title = '点击复制';
-    const labelElement = document.createElement('span');
-    labelElement.className = 'opx-copy-label';
-    labelElement.textContent = `${label}：`;
-    const valueElement = document.createElement('strong');
-    valueElement.textContent = value;
-    const feedbackElement = document.createElement('span');
-    feedbackElement.className = 'opx-copy-feedback';
-    feedbackElement.textContent = '已复制';
-    feedbackElement.hidden = true;
-    let feedbackTimer: number | null = null;
-    row.append(labelElement, valueElement, feedbackElement);
-    row.addEventListener('click', async () => {
-      await navigator.clipboard.writeText(value);
-      if (feedbackTimer) {
-        window.clearTimeout(feedbackTimer);
-      }
-      row.classList.add('is-copied');
-      feedbackElement.hidden = false;
-      feedbackTimer = window.setTimeout(() => {
-        row.classList.remove('is-copied');
-        feedbackElement.hidden = true;
-        feedbackTimer = null;
-      }, 1400);
-    });
-    return row;
-  }
-
-  function createSection(section: AddressSection): HTMLElement {
-    const body = document.createElement('div');
-    body.className = 'opx-copy-section-body';
-    for (const item of section.items) {
-      if (!item.value) {
-        continue;
-      }
-      body.append(createCopyRow(item.label, item.value));
-    }
-
-    if (section.collapsed) {
-      const details = document.createElement('details');
-      details.className = 'opx-accordion-section';
-      const summaryElement = document.createElement('summary');
-      summaryElement.textContent = section.title;
-      details.append(summaryElement, body);
-      return details;
-    }
-
-    const wrapper = document.createElement('section');
-    wrapper.className = 'opx-copy-section';
-    const title = document.createElement('div');
-    title.className = 'opx-copy-section-title';
-    title.textContent = section.title;
-    wrapper.append(title, body);
-    return wrapper;
-  }
-}
-
-function addressSections(address: AddressProfile): AddressSection[] {
-  return [
-    {
-      title: '地址资料',
-      items: [
-        { label: '国家', value: `${address.countryLabel || address.countryCode} / ${address.countryCode}` },
-        { label: '姓名', value: address.fullName },
-        { label: '电话', value: address.phone },
-        { label: '地址1', value: address.line1 },
-        { label: '地址2', value: address.line2 },
-        { label: '城市', value: address.city },
-        { label: '州/省', value: address.stateFull ? `${address.stateFull} / ${address.state}` : address.state },
-        { label: '邮编', value: address.postalCode },
-      ],
-    },
-    {
-      title: '信用卡资料',
-      items: [
-        { label: '卡类型', value: address.creditCard.type },
-        { label: '卡号', value: address.creditCard.number },
-        { label: 'CVV', value: address.creditCard.cvv },
-        { label: '有效期', value: address.creditCard.expires },
-        { label: '后四位', value: address.creditCard.last4 },
-      ],
-    },
-    {
-      title: '身份资料',
-      collapsed: true,
-      items: [
-        { label: '性别', value: address.identity.gender },
-        { label: '称谓', value: address.identity.title },
-        { label: '生日', value: address.identity.birthday },
-        { label: '用户名', value: address.identity.username },
-        { label: '密码', value: address.identity.password },
-        { label: '临时邮箱', value: address.identity.temporaryMail },
-        { label: '系统', value: address.identity.system },
-        { label: '网站', value: address.identity.website },
-        { label: '安全问题', value: address.identity.securityQuestion },
-        { label: '安全答案', value: address.identity.securityAnswer },
-      ],
-    },
-    {
-      title: '就业资料',
-      collapsed: true,
-      items: [
-        { label: '公司', value: address.employment.companyName },
-        { label: '职业', value: address.employment.occupation },
-        { label: '就业状态', value: address.employment.employmentStatus },
-        { label: '月薪', value: address.employment.monthlySalary },
-        { label: '公司规模', value: address.employment.companySize },
-        { label: '教育背景', value: address.employment.educationalBackground },
-      ],
-    },
-  ];
 }
 
 function createCountrySelect(): HTMLSelectElement {

@@ -4,7 +4,7 @@ import type { LinkExtractorState } from '../features/link-extractor/types';
 import type { AccountInputMode, RegisterState } from '../features/register/types';
 import type { SmsCodeRecord, SmsRelayState } from '../features/sms/types';
 
-export const DEFAULT_API_BASE = 'http://127.0.0.1:8787';
+export const DEFAULT_API_BASE = '';
 
 const STORAGE_KEY = 'opx.registerAssist.state';
 

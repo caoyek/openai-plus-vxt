@@ -1,5 +1,5 @@
 import type { AddressProfile } from '../address-autofill/types';
-import type { AddressAutofillSettings, ExtensionSettings } from './types';
+import type { AddressAutofillSettings, ExtensionSettings, TempMailSettings } from './types';
 
 const SETTINGS_STORAGE_KEY = 'opx.extension.settings';
 
@@ -14,6 +14,14 @@ const DEFAULT_ADDRESS_AUTOFILL_SETTINGS: AddressAutofillSettings = {
 
 const DEFAULT_SETTINGS: ExtensionSettings = {
   addressAutofill: DEFAULT_ADDRESS_AUTOFILL_SETTINGS,
+  tempMail: {
+    apiBase: '',
+    adminAuth: '',
+    domain: '',
+    mailboxName: '',
+    customAuth: '',
+    updatedAt: 0,
+  },
   updatedAt: 0,
 };
 
@@ -70,10 +78,33 @@ export async function loadAddressAutofillSettings(): Promise<AddressAutofillSett
   return (await loadExtensionSettings()).addressAutofill;
 }
 
+export async function loadTempMailSettings(): Promise<TempMailSettings> {
+  return (await loadExtensionSettings()).tempMail;
+}
+
+export async function saveTempMailSettings(
+  patch: Partial<TempMailSettings>,
+): Promise<TempMailSettings> {
+  const current = await loadExtensionSettings();
+  const tempMail = normalizeTempMailSettings({
+    ...current.tempMail,
+    ...patch,
+    updatedAt: Date.now(),
+  });
+  const next = normalizeExtensionSettings({
+    ...current,
+    tempMail,
+    updatedAt: Date.now(),
+  });
+  await browser.storage.local.set({ [SETTINGS_STORAGE_KEY]: next });
+  return next.tempMail;
+}
+
 export function normalizeExtensionSettings(value: unknown): ExtensionSettings {
   const source = isRecord(value) ? value : {};
   return {
     addressAutofill: normalizeAddressAutofillSettings(source.addressAutofill),
+    tempMail: normalizeTempMailSettings(source.tempMail),
     updatedAt: Number(source.updatedAt || DEFAULT_SETTINGS.updatedAt),
   };
 }
@@ -177,8 +208,33 @@ function normalizeCreditCard(value: unknown): AddressProfile['creditCard'] {
   };
 }
 
+function normalizeTempMailSettings(value: unknown): TempMailSettings {
+  const source = isRecord(value) ? value : {};
+  return {
+    apiBase: normalizeUrlBase(source.apiBase || source.workerUrl),
+    adminAuth: String(source.adminAuth || '').trim(),
+    domain: String(source.domain || '').trim(),
+    mailboxName: String(source.mailboxName || source.name || '').trim(),
+    customAuth: String(source.customAuth || '').trim(),
+    updatedAt: Number(source.updatedAt || DEFAULT_SETTINGS.tempMail.updatedAt),
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object');
+}
+
+function normalizeUrlBase(value: unknown): string {
+  const raw = String(value || '').trim().replace(/\/+$/, '');
+  if (!raw) {
+    return '';
+  }
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString().replace(/\/+$/, '') : '';
+  } catch {
+    return '';
+  }
 }
 
 function normalizeCountryCode(value: unknown): string {

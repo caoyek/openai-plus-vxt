@@ -2,17 +2,11 @@ import type { FeaturePanelHandle } from '../../app/types';
 import type { RegisterController } from './types';
 
 export function createRegisterPanel(container: HTMLElement, controller: RegisterController): FeaturePanelHandle {
-  const accountInput = document.createElement('textarea');
-  accountInput.className = 'opx-textarea';
-  accountInput.placeholder = '邮箱或 Outlook 行';
-  accountInput.autocomplete = 'off';
-  accountInput.spellcheck = false;
-
   const inputHint = document.createElement('div');
   inputHint.className = 'opx-hint';
-  inputHint.textContent = '支持 user@example.com 或 email----password----client_id----refresh_token';
+  inputHint.textContent = '点击按钮会自动创建临时邮箱并填入当前注册页。';
 
-  const emailButton = createButton('填入邮箱并继续');
+  const emailButton = createButton('生成邮箱并继续');
   const otp = document.createElement('input');
   otp.className = 'opx-input';
   otp.type = 'text';
@@ -31,28 +25,17 @@ export function createRegisterPanel(container: HTMLElement, controller: Register
   const update = async () => {
     const page = controller.getPageState();
     const saved = await controller.loadState();
-    if (accountInput.value !== saved.rawInput) {
-      accountInput.value = saved.rawInput;
-    }
     emailButton.disabled = !page.canFillEmail;
     otpButton.disabled = !page.canFillOtp;
     autoOtpButton.disabled = !page.canFillOtp || !saved.autoOtp;
     profileButton.disabled = !page.canFillProfile;
-    inputHint.textContent = saved.autoOtp
-      ? 'Outlook 行模式：验证码页会通过本地 API 自动收码'
-      : '单邮箱模式：验证码需要手动输入';
+    inputHint.textContent = saved.email
+      ? `当前临时邮箱：${saved.email}`
+      : '点击按钮会自动创建临时邮箱并填入当前注册页。';
   };
 
-  accountInput.addEventListener('input', async () => {
-    const saved = await controller.saveInput(accountInput.value);
-    inputHint.textContent = saved.autoOtp
-      ? 'Outlook 行模式：验证码页会通过本地 API 自动收码'
-      : '单邮箱模式：验证码需要手动输入';
-  });
-
   emailButton.addEventListener('click', async () => {
-    setStatus(status, '正在提交邮箱...', 'pending');
-    await controller.saveInput(accountInput.value);
+    setStatus(status, '正在生成临时邮箱...', 'pending');
     setResult(status, await controller.fillEmailFromInput());
     await update();
   });
@@ -64,7 +47,7 @@ export function createRegisterPanel(container: HTMLElement, controller: Register
   });
 
   autoOtpButton.addEventListener('click', async () => {
-    setStatus(status, '等待 Outlook 验证码...', 'pending');
+    setStatus(status, '等待临时邮箱验证码...', 'pending');
     setResult(status, await controller.waitForOutlookOtp());
     await update();
   });
@@ -75,7 +58,7 @@ export function createRegisterPanel(container: HTMLElement, controller: Register
     await update();
   });
 
-  container.append(accountInput, inputHint, emailButton, otp, otpButton, autoOtpButton, profileButton, status);
+  container.append(inputHint, emailButton, otp, otpButton, autoOtpButton, profileButton, status);
   void update();
   return { update };
 }
