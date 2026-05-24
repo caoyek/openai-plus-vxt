@@ -1212,6 +1212,7 @@ function scheduleConsentClick(delayMs: number): void {
     if (row) {
       clickElement(row);
     }
+    scheduleCloseIncognitoWindow();
     window.setTimeout(() => {
       if (findPaypalConsentButton()) {
         consentClicked = false;
@@ -1221,6 +1222,15 @@ function scheduleConsentClick(delayMs: number): void {
       }
     }, 2500);
   }, delayMs);
+}
+
+function scheduleCloseIncognitoWindow(): void {
+  void browser.runtime.sendMessage({
+    type: 'opx:close-incognito-window',
+    delayMs: 25_000,
+  }).catch(() => {
+    // Closing is best-effort and only applies to incognito windows.
+  });
 }
 
 function cancelScheduledAutofill(): void {

@@ -13,6 +13,7 @@
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "lan": "node scripts/lan-pay-server.mjs",
+    "lan:py": "python3 scripts/lan_pay_server.py",
     "compile": "tsc --noEmit",
     "postinstall": "wxt prepare"
   },

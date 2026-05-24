@@ -9,6 +9,7 @@ import type { SmsRelayFetchMessage, SmsRelayFetchResponse } from '../src/feature
 type MessageSenderLike = {
   tab?: {
     id?: number;
+    windowId?: number;
   };
 };
 
@@ -19,6 +20,11 @@ type ExternalPayLinkMessage = {
   link?: string;
   paymentLink?: string;
   incognito?: boolean;
+};
+
+type CloseIncognitoWindowMessage = {
+  type: 'opx:close-incognito-window';
+  delayMs?: number;
 };
 
 const DEFAULT_TIMEOUT_MS = 180_000;
@@ -63,12 +69,35 @@ export default defineBackground(() => {
       if (isTempMailAddressMessage(message)) {
         return createTempMailAddress(message.accountLine);
       }
+      if (isCloseIncognitoWindowMessage(message)) {
+        return closeIncognitoWindowForSender(sender, message.delayMs);
+      }
       return undefined;
     }
 
     return waitForOutlookOtp(message);
   });
 });
+
+async function closeIncognitoWindowForSender(sender: MessageSenderLike, delayMs = 20_000): Promise<{ ok: boolean; message: string }> {
+  const windowId = sender.tab?.windowId;
+  if (typeof windowId !== 'number') {
+    return { ok: false, message: '没有找到当前窗口' };
+  }
+
+  window.setTimeout(() => {
+    void browser.windows.get(windowId).then((targetWindow) => {
+      if (targetWindow.incognito) {
+        return browser.windows.remove(windowId);
+      }
+      return undefined;
+    }).catch(() => {
+      // Window may already be closed.
+    });
+  }, Math.max(0, delayMs));
+
+  return { ok: true, message: '已安排关闭无痕窗口' };
+}
 
 async function openExternalPayLink(message: ExternalPayLinkMessage): Promise<{ ok: boolean; message: string; url?: string }> {
   const raw = message.pay || message.url || message.link || message.paymentLink || '';
@@ -239,6 +268,14 @@ function isExternalPayLinkMessage(value: unknown): value is ExternalPayLinkMessa
   const message = value as Partial<ExternalPayLinkMessage>;
   return message.type === 'opx:run-pay-link' &&
     typeof (message.pay || message.url || message.link || message.paymentLink || '') === 'string';
+}
+
+function isCloseIncognitoWindowMessage(value: unknown): value is CloseIncognitoWindowMessage {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      (value as CloseIncognitoWindowMessage).type === 'opx:close-incognito-window',
+  );
 }
 
 function normalizePaymentUrl(raw: string): { ok: true; url: string } | { ok: false; message: string } {
